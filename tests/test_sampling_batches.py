@@ -63,6 +63,10 @@ class DummyModel(torch.nn.Module):
         super().__init__()
         self.parameter = torch.nn.Parameter(torch.randn(()))
         self.njoints, self.nfeats = joints, 1
+        self.cond_mode = 'text'
+
+    def encode_text_with_mask(self, texts):
+        return torch.ones(len(texts), 2, 3), torch.ones(len(texts), 2)
 
 
 class SamplingBatchTests(unittest.TestCase):
@@ -137,7 +141,7 @@ class SamplingBatchTests(unittest.TestCase):
             next(iterator)
 
     def run_main(self, size=3, batch_size=2, repetitions=2, entire_set=True,
-                 random_order=False, projected=True):
+                 random_order=False, projected=True, stage1_only=False):
         import sample.sample_2stage as sampling
         grasp_loader, full_loader = self.loaders(size, batch_size, reversed_grasp=True, projected=projected)
         interaction = GenerateArgs()
@@ -152,17 +156,21 @@ class SamplingBatchTests(unittest.TestCase):
             setattr(interaction, key, value)
         grasp = copy.deepcopy(interaction)
         grasp.pre_grasp = grasp.traj_only = grasp.hands_only = True
+        interaction.stage1_only = grasp.stage1_only = stage1_only
         calls, expected_physical = [], []
+        grasp_noises = []
 
         def create(args, data):
             return DummyModel(108 if args.pre_grasp else 117), SimpleNamespace()
 
-        def sample_flow(model, diffusion, shape, model_kwargs, cond_fn=None):
+        def sample_flow(model, diffusion, shape, model_kwargs, cond_fn=None, noise=None):
             y = model_kwargs['y']
             self.assertEqual(shape[0], len(y['data_id']))
             self.assertEqual(y['inpainted_motion'].shape, shape)
             calls.append((shape[1], list(y['data_id'])))
             if shape[1] == 108:
+                if noise is not None:
+                    grasp_noises.append(noise.numpy().copy())
                 return [y['inpainted_motion'].clone()]
             # Execute all production conditioning and conversion, replacing only
             # the expensive network/sampler with a known physical prediction.
@@ -184,6 +192,24 @@ class SamplingBatchTests(unittest.TestCase):
              patch.object(sampling.dist_util, 'dev', return_value=torch.device('cpu')):
             sampling.main()
         path = Path(interaction.output_dir) / f'results_{interaction.gen_split}_fixture.npy'
+        if stage1_only:
+            self.assertFalse(path.exists())
+            self.assertEqual(calls, [(108, ['s6_mug_pass_1'])] * repetitions)
+            archives = sorted(path.parent.glob('stage1_*.npz'))
+            self.assertEqual(len(archives), repetitions)
+            for repetition, archive in enumerate(archives):
+                with np.load(archive) as saved:
+                    self.assertEqual(saved['repetition_index'].item(), repetition)
+                    self.assertEqual(saved['motion'].shape, (1, 50, 108))
+                    self.assertEqual(saved['reference_motion'].shape, (1, 50, 117))
+                    self.assertEqual(saved['object_bps'].shape, (1, 1, 1024, 3))
+                    self.assertEqual(saved['t5_emb'].shape, (1, 2, 3))
+                    np.testing.assert_array_equal(saved['keyframes'], [0, 49])
+                    np.testing.assert_array_equal(saved['noise'], grasp_noises[repetition])
+                    np.testing.assert_array_equal(saved['motion'], saved['normalized_motion'])
+                    np.testing.assert_array_equal(saved['data_id'], ['s6_mug_pass_1'])
+            return
+
         result = np.load(path, allow_pickle=True).item()
         for stage_one, stage_two in zip(calls[::2], calls[1::2]):
             self.assertEqual(stage_one[1], stage_two[1])
@@ -200,6 +226,9 @@ class SamplingBatchTests(unittest.TestCase):
         self.assertEqual(result['repetition_index'], [0, 1, 2])
         self.assertEqual(result['num_samples'], 1)
         self.assertEqual(result['num_generated'], 3)
+
+    def test_stage1_only_saves_each_repetition_without_resampling_stage2(self):
+        self.run_main(batch_size=1, repetitions=2, entire_set=False, stage1_only=True)
 
     def test_main_entire_set_keeps_tail_and_repeats_every_condition(self):
         result = self.run_main()

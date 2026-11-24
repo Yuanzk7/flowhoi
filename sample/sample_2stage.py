@@ -34,6 +34,7 @@ from sample.sampling_utils import (
     fix_ambiguous_object_names,
     get_conditioning_thresholds,
     sample_flow_matching,
+    save_stage1_reference,
     save_results,
 )
 
@@ -68,6 +69,9 @@ def load_grasp_model(data, args_traj):
 
 def load_stage_datasets(grasp_args, interaction_args, grasp_frames, interaction_frames):
     """Keep the full-motion loader's cap independent of the grasp prefix."""
+    if interaction_args.stage1_only:
+        interaction_args = copy.copy(interaction_args)
+        interaction_args.feed_scene_inputs = False
     return (load_dataset(grasp_args, grasp_frames, grasp_frames, shuffle=False),
             load_dataset(interaction_args, interaction_frames, interaction_frames, shuffle=False))
 
@@ -86,6 +90,7 @@ def main():
     niter = os.path.basename(args.model_path).replace('model', '').replace('.pt', '').replace('_best', '_best')
 
     args = generate_args(model_path=args.grasp_model_path)
+    save_stage1 = args_interaction.save_stage1 or args_interaction.stage1_only
 
     dataset_attrs = [
         'dataset', 'data_dir', 'motion_representation', 'split_file',
@@ -188,8 +193,6 @@ def main():
         model_kwargs_grasp['y']['text'] = texts_pre
         model_kwargs['y']['text'] = texts
 
-        attach_scene_inputs(args_interaction, model_kwargs, model_device)
-
         key_frames = [0, 49]
 
         motion_gt = data_interaction.dataset.motion_dataset.inv_transform_th(
@@ -277,10 +280,26 @@ def main():
             cond_fn_traj = None
 
         shape_grasp = (batch_size, grasp_model.njoints, grasp_model.nfeats, n_frames)
+        grasp_y = grasp_model_kwargs['y']
+        sampling_kwargs = {}
+        if save_stage1:
+            if grasp_y.get('t5_emb') is None and 'text' in grasp_model.cond_mode:
+                grasp_y['t5_emb'], grasp_y['t5_mask'] = grasp_model.encode_text_with_mask(texts_pre)
+            initial_noise = torch.randn(shape_grasp, device=model_device)
+            sampling_kwargs['noise'] = initial_noise
+            reference_extra = {'keyframes': key_frames}
+            if args.guidance:
+                reference_extra.update(target=target, target_mask=target_mask)
+            if grasp_y['do_inpainting']:
+                reference_extra['inpainting_rng_state'] = (
+                    torch.cuda.get_rng_state(model_device) if model_device.type == 'cuda'
+                    else torch.get_rng_state())
+                reference_extra['inpainting_rng_device'] = model_device.type
+
         inference_start_time = time.time()
         grasp_sample = sample_flow_matching(
             ClassifierFreeGuidance(grasp_model), grasp_diffusion, shape_grasp,
-            grasp_model_kwargs, cond_fn=cond_fn_traj)
+            grasp_model_kwargs, cond_fn=cond_fn_traj, **sampling_kwargs)
         stage1_time = time.time() - inference_start_time
         print(f"Stage 1 inference time: {stage1_time:.4f}s")
 
@@ -295,7 +314,17 @@ def main():
             grasp_sample, grasp_batch_args, grasp_model_kwargs, grasp_model, gen_eff_len,
             grasp_inv_transform)
 
+        if save_stage1:
+            save_stage1_reference(
+                out_path, batch_index, repetition, args, grasp_y,
+                motion=cur_motions_grasp_pose_space[-1], normalized_motion=grasp_sample[-1],
+                reference_motion=motion_gt[..., :gen_eff_len], noise=initial_noise,
+                std_mean=data.dataset.motion_dataset.get_std_mean(), extra=reference_extra)
+        if args_interaction.stage1_only:
+            continue
+
         print("##### Stage 2: Generating full interaction #####")
+        attach_scene_inputs(args_interaction, model_kwargs, model_device)
         model, diffusion = create_model_and_diffusion(args_interaction, data_interaction)
         print(f"Loading checkpoints from [{args_interaction.model_path}]...")
         load_saved_model(model, args_interaction.model_path)
@@ -433,6 +462,10 @@ def main():
         repetition_indices.extend([repetition] * batch_size)
 
         all_gt_kf.extend(motion_gt_kf.swapaxes(2, 3))
+
+    if args_interaction.stage1_only:
+        print(f'[Done] Stage 1 references are at [{os.path.abspath(out_path)}]')
+        return
 
     all_motions = np.concatenate(all_motions, axis=0)
     all_gt_kf = np.concatenate(all_gt_kf, axis=0) if all_gt_kf else np.array([])

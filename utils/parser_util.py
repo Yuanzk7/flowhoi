@@ -542,6 +542,12 @@ class SamplingOptions:
 class GenerateOptions:
     """Generation request options."""
 
+    save_stage1: bool = field(
+        default=False,
+        metadata={"help": "Save Stage 1 motion, conditioning, and noise for each batch and repetition."})
+    stage1_only: bool = field(
+        default=False,
+        metadata={"help": "Save Stage 1 references and skip Stage 2 inference."})
     max_frames_grasp: int = field(
         default=50,
         metadata={

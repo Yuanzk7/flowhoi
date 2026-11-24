@@ -1,0 +1,10 @@
+{
+  "T_base_object": null,
+  "T_base_table": null,
+  "T_flange_hand": null,
+  "T_flange_tcp": null,
+  "table_size_m": null,
+  "start_joints_rad": null,
+  "min_clearance_m": null,
+  "rh56_raw_limits": null
+}

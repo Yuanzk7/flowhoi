@@ -15,6 +15,23 @@
 #   DATASET=hot3d bash demo.sh  # HOT3D: scene-conditioned model
 set -e
 
+PYTHON_BIN=$(command -v python)
+has_libx264() {
+  "$1" -hide_banner -encoders 2>/dev/null |
+    awk '$2 == "libx264" { found = 1 } END { exit !found }'
+}
+
+FFMPEG_BIN=$(command -v ffmpeg || true)
+if [ -z "$FFMPEG_BIN" ] || ! has_libx264 "$FFMPEG_BIN"; then
+  if [ -x /usr/bin/ffmpeg ] && has_libx264 /usr/bin/ffmpeg; then
+    export PATH="/usr/bin:$PATH"
+    echo "Using /usr/bin/ffmpeg for libx264 video encoding."
+  else
+    echo "FFmpeg with the libx264 encoder is required to render MP4 videos." >&2
+    exit 1
+  fi
+fi
+
 DATASET=${DATASET:-grab}
 if [ "$DATASET" != "grab" ] && [ "$DATASET" != "hot3d" ]; then
   echo "Unsupported DATASET: $DATASET (choose grab or hot3d)." >&2
@@ -51,7 +68,7 @@ for d in dataset; do
 done
 
 echo "== Stage 1+2 inference ($N sample(s), split: $SPLIT) =="
-python -m sample.sample_2stage \
+"$PYTHON_BIN" -m sample.sample_2stage \
   --model_path "$MODEL" \
   --grasp_model_path "$GRASP_MODEL" \
   --guidance --num_samples "$N" --seed 42 \
@@ -60,7 +77,7 @@ python -m sample.sample_2stage \
 
 echo
 echo "== Rendering to mp4 =="
-python -m visualize.visualize_sequences \
+"$PYTHON_BIN" -m visualize.visualize_sequences \
   --folder_path "$OUT" \
   --dataset "$DATASET" --output_fps "$FPS" --range_max "$N" \
   --resolution medium

@@ -1,6 +1,7 @@
 """Shared utilities for unified sampling scripts."""
 import os
 import json
+import tempfile
 from datetime import datetime
 from typing import Tuple, List, Dict
 
@@ -180,12 +181,13 @@ def sample_flow_matching(
     shape: Tuple,
     model_kwargs: Dict,
     cond_fn=None,
+    noise=None,
 ) -> List[torch.Tensor]:
     """Run flow-matching sampling and return a list of samples."""
     sample = diffusion.p_sample_loop(
         model=model,
         shape=shape,
-        noise=None,
+        noise=noise,
         model_kwargs=model_kwargs,
         progress=True,
         cond_fn=cond_fn,
@@ -194,6 +196,47 @@ def sample_flow_matching(
     if isinstance(sample, list):
         return sample
     return [sample]
+
+
+def save_stage1_reference(out_path, batch_index, repetition, args, y, *,
+                          motion, normalized_motion, reference_motion, noise,
+                          std_mean, extra):
+    """Save the Stage 1 inputs and outputs in a pickle-free per-batch archive."""
+    name = f'stage1_{args.gen_split}_{args.split_set}_b{batch_index:04d}_r{repetition:04d}.npz'
+    path = os.path.join(out_path, name)
+    std, mean = std_mean
+    fields = {
+        'motion': motion[:, 0],  # [B, T, C]
+        'normalized_motion': normalized_motion[:, :, 0].transpose(1, 2),
+        'reference_motion': reference_motion[:, 0].transpose(1, 2),
+        'noise': noise,  # [B, C, 1, T], as passed to the sampler
+        'mean': mean,
+        'std': std,
+        'batch_index': batch_index,
+        'repetition_index': repetition,
+        'args_json': json.dumps(vars(args), sort_keys=True),
+        **extra,
+    }
+    for key in ('data_id', 'text', 'lengths', 'mask', 't5_emb', 't5_mask',
+                'initial_pos', 'scale', 'grasp_model', 'cond_until'):
+        if y.get(key) is not None:
+            fields[key] = y[key]
+    if y.get('object_bps') is not None:
+        bps = y['object_bps']
+        fields['object_bps'] = torch.stack([torch.as_tensor(value) for value in bps]) if isinstance(bps, list) else bps
+    if y['do_inpainting']:
+        for key in ('inpainted_motion', 'inpainting_mask', 'impute_until',
+                    'inpainted_motion_second_stage', 'inpainting_mask_second_stage',
+                    'impute_until_second_stage'):
+            fields[key] = y[key]
+
+    arrays = {key: value.detach().cpu().numpy() if torch.is_tensor(value) else value
+              for key, value in fields.items()}
+    with tempfile.TemporaryDirectory(dir=out_path) as temp_dir:
+        temp_path = os.path.join(temp_dir, name)
+        np.savez_compressed(temp_path, **arrays)
+        os.replace(temp_path, path)
+    print(f'Saved Stage 1 reference to [{path}]')
 
 
 def save_results(

@@ -15,6 +15,8 @@ from scipy.interpolate import CubicSpline
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
+from sample.grasp_interface import preshape_at
+from sample.rh56f1_retarget import preshape_joints
 from sample.validate_rh56f1 import (
     FPS, HOLD_SECONDS, LIFT_HEIGHT, MIN_HEIGHT, cup_contact_forces,
     hand_fingers, joint_name, smooth, text, transform,
@@ -26,6 +28,7 @@ DEFAULT_XARM_ROOT = Path(__file__).resolve().parents[1] / 'third_party/robot_mod
 HOME = (0., -.45, 0., 1.1, 0., .9, 0.)
 APPROACH_LENGTH = .08
 COLLISION_MARGIN = .0005
+AZIMUTHS = (0, 20, -20, 35, -35, 50, -50)
 
 
 def expand_urdf(root, xacro, work):
@@ -56,6 +59,18 @@ def add_arm_model_arguments(parser):
                         help='Override the bundled xArm7 model directory with a model bundle or xArm ROS 2 checkout')
     parser.add_argument('--xacro', default='xacro', help='Xacro executable for an unexpanded xArm ROS 2 checkout')
     parser.add_argument('--arm-urdf', type=Path, help='Override the expanded xArm7 URDF')
+
+
+def add_flowhoi_motion_arguments(parser):
+    parser.add_argument('--approach', choices=('flowhoi', 'flange'), default='flowhoi',
+                        help='flowhoi: retreat against the FlowHOI palm travel direction first, with the flange '
+                             'axis as fallback. flange: only the flange axis, as before')
+    parser.add_argument('--preshape', choices=('flowhoi', 'open'), default='flowhoi',
+                        help='flowhoi: open the fingers by the FlowHOI aperture profile against the remaining '
+                             'distance, falling back to the open hand. open: hold the open hand, as before')
+    parser.add_argument('--object-symmetry', choices=('none', 'z'), default='none',
+                        help='z: the object is symmetric about its +z axis (a plain cup), so the grasp and its '
+                             'approach may be rotated about that axis to suit the arm. none: use the grasp as fitted')
 
 
 def numbers(value):
@@ -357,6 +372,57 @@ class ArmTrial:
         return distance, None if pair is None else [self.model.geom(i).name for i in pair]
 
 
+def flowhoi_approach(grasp, frame_rotation_source):
+    """FlowHOI approach direction from a retarget archive, in the frame of ``frame_rotation_source``."""
+    if 'approach_valid' not in grasp or not bool(grasp['approach_valid']):
+        return None
+    return np.asarray(frame_rotation_source)[:3, :3] @ grasp['approach_dir_object']
+
+
+def flowhoi_preshape(grasp):
+    """Hand angles as a function of remaining flange distance, or None for an older archive."""
+    if 'preshape' not in grasp:
+        return None
+    remaining, amount, q_open = grasp['preshape_remaining_m'], grasp['preshape'], grasp['q_open_rad']
+    return lambda distance: preshape_joints(q_open, preshape_at(distance, remaining, amount))
+
+
+def about_object_axis(degrees):
+    """Rotation about the object +z axis through its origin, as a 4x4 transform."""
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler('z', degrees, degrees=True).as_matrix()
+    return pose
+
+
+def symmetry_yaws(symmetry):
+    """Grasp rotations about the object axis to try, nearest to the fitted grasp first."""
+    if symmetry == 'none':
+        return (0.,)
+    return (0., 30., -30., 60., -60., 90., -90., 120., -120., 150., -150., 180.)
+
+
+def plan_over_symmetry(attempt, symmetry):
+    """Call ``attempt(yaw)`` over the allowed object-axis rotations until one plans.
+
+    For an object symmetric about its +z axis (a plain cup on a table), rotating the whole
+    grasp, approach included, leaves the grasp physically the same while letting a fixed
+    arm reach it from its own side.
+    """
+    failure = None
+    for yaw in symmetry_yaws(symmetry):
+        try:
+            paths, targets, clearances, choice = attempt(yaw)
+        except PlanningFailure as error:
+            if failure is None or (error.grasp_ik_found and not failure.grasp_ik_found):
+                failure = error
+            if symmetry != 'none':
+                print(f'Object-axis rotation {yaw:+.0f} deg: {error}', flush=True)
+            continue
+        choice['grasp_axis_rotation_deg'] = yaw
+        return paths, targets, clearances, choice
+    raise failure
+
+
 class PlanningFailure(ValueError):
     def __init__(self, grasp_ik_found, best_clearances):
         super().__init__('No collision-free start, pregrasp, grasp and lift path at the required margin')
@@ -364,27 +430,76 @@ class PlanningFailure(ValueError):
         self.best_clearances = best_clearances
 
 
-def plan(trial, goal, home, *, margin=COLLISION_MARGIN, up=(0., 0., 1.), check_path=None):
+def flange_position(trial, q):
+    """Flange position for arm angles ``q`` without disturbing the current state."""
+    saved = trial.data.qpos.copy()
+    trial.set_arm(q)
+    position = trial.flange_pose()[0].copy()
+    trial.data.qpos[:] = saved
+    mujoco.mj_kinematics(trial.model, trial.data)
+    return position
+
+
+def preshape_states(trial, preshape, distance_to_pregrasp):
+    """Hand-state setters for path fractions of the transit and approach, or (None, None).
+
+    The remaining distance is approximated as the straight approach length plus the
+    straight-line distance from the transit start to the pregrasp.
+    """
+    if preshape is None:
+        return None, None
+    return (lambda u: trial.set_hand(preshape(APPROACH_LENGTH + (1 - u) * distance_to_pregrasp)),
+            lambda u: trial.set_hand(preshape(APPROACH_LENGTH * (1 - u))))
+
+
+def pregrasp_candidates(goal, vertical, approach_dir=None):
+    """Pregrasp poses ordered by preference, as (pose, source, degrees from the FlowHOI approach).
+
+    With a FlowHOI approach direction the hand retreats against its direction of travel,
+    then against nearby directions rotated about the vertical; the flange-axis retreats used
+    before are kept as fallbacks.
+    """
+    reference = None if approach_dir is None else -np.asarray(approach_dir) / np.linalg.norm(approach_dir)
+    directions = []
+    if reference is not None:
+        directions += [('flowhoi', Rotation.from_rotvec(np.deg2rad(a) * vertical).apply(reference)) for a in AZIMUTHS]
+    directions += [('flange_axis', Rotation.from_rotvec(np.deg2rad(a) * vertical).apply(-goal[:3, 2])) for a in AZIMUTHS]
+    candidates = []
+    for source, backward in directions:
+        pregrasp = goal.copy()
+        pregrasp[:3, 3] += APPROACH_LENGTH * backward
+        deviation = None if reference is None else float(np.rad2deg(np.arccos(np.clip(backward @ reference, -1, 1))))
+        candidates.append((pregrasp, source, deviation))
+    return candidates
+
+
+def plan(trial, goal, home, *, margin=COLLISION_MARGIN, up=(0., 0., 1.), check_path=None,
+         approach_dir=None, preshape=None):
+    """Plan home -> pregrasp -> grasp -> lift.
+
+    ``approach_dir`` is the FlowHOI palm travel direction in the planning frame. ``preshape``
+    maps the remaining flange distance to the goal onto hand joint angles; when given, transit
+    and approach clearances are checked with that hand state, falling back to the open hand.
+    Returns paths, targets, clearances and a dict describing the choices made.
+    """
     best = {}
     vertical = np.asarray(up)
 
-    def evaluate(phase, path, samples):
+    def evaluate(phase, path, samples, state=None):
         if check_path is None:
-            result = trial.clearance(path, phase != 'lift', samples)
+            result = trial.clearance(path, phase != 'lift', samples, apply_state=state)
         else:
-            result = check_path(phase, path, samples)
+            result = check_path(phase, path, samples, state)
         if phase not in best or result[0] > best[phase][0]:
             best[phase] = result
         return result
 
+    home_flange = flange_position(trial, home)
+
     lift = goal.copy()
     lift[:3, 3] += LIFT_HEIGHT * vertical
-    pregrasps = []
-    for azimuth in (0, 20, -20, 35, -35, 50, -50):
-        backward = Rotation.from_rotvec(np.deg2rad(azimuth) * vertical).apply(-goal[:3, 2])
-        pregrasp = goal.copy()
-        pregrasp[:3, 3] += APPROACH_LENGTH * backward
-        pregrasps.append(pregrasp)
+    pregrasps = pregrasp_candidates(goal, vertical, approach_dir)
+    modes = ('flowhoi', 'open') if preshape is not None else ('open',)
     seeds = [home, np.zeros(7), [0, .7, 0, 1.7, 0, -.45, 0],
              [0, -.1, 0, 1.2, 0, 1.5, 1.5], [0, .4, 0, .8, 0, .5, -1.5]]
     seeds.extend(np.random.default_rng(19).uniform(trial.bounds[0], trial.bounds[1], (22, 7)))
@@ -406,7 +521,7 @@ def plan(trial, goal, home, *, margin=COLLISION_MARGIN, up=(0., 0., 1.), check_p
         lift_clearance = evaluate('lift', lift_path, 65)
         if lift_clearance[0] < margin:
             continue
-        for pregrasp in pregrasps:
+        for index, (pregrasp, source, deviation) in enumerate(pregrasps):
             retreat = trial.linear_ik(goal, pregrasp, grasp_q)
             if retreat is None:
                 continue
@@ -414,24 +529,32 @@ def plan(trial, goal, home, *, margin=COLLISION_MARGIN, up=(0., 0., 1.), check_p
             def approach(u):
                 return retreat(1 - np.asarray(u))
 
-            approach_clearance = evaluate('approach', approach, 65)
-            if approach_clearance[0] < margin:
-                continue
             start_q = approach(0.)
 
             def transit(u):
                 return home + np.asarray(u)[..., None] * (start_q - home)
 
-            transit_clearance = evaluate('transit', transit, 97)
-            clearances = (transit_clearance, approach_clearance, lift_clearance)
-            print('Path clearance (transit, approach, lift): '
-                  + ', '.join(f'{d * 1000:.1f} mm {pair}' for d, pair in clearances), flush=True)
-            if transit_clearance[0] >= margin:
-                return (transit, approach, lift_path), (pregrasp, goal, lift), clearances
+            transit_state, approach_state = preshape_states(trial, preshape,
+                                                            np.linalg.norm(pregrasp[:3, 3] - home_flange))
+            for mode in modes:
+                states = (transit_state, approach_state) if mode == 'flowhoi' else (None, None)
+                approach_clearance = evaluate('approach', approach, 65, states[1])
+                if approach_clearance[0] < margin:
+                    continue
+                transit_clearance = evaluate('transit', transit, 97, states[0])
+                clearances = (transit_clearance, approach_clearance, lift_clearance)
+                print(f'Pregrasp {index} ({source}, hand {mode}) clearance (transit, approach, lift): '
+                      + ', '.join(f'{d * 1000:.1f} mm {pair}' for d, pair in clearances), flush=True)
+                if transit_clearance[0] >= margin:
+                    info = dict(approach_source=source, approach_deviation_deg=deviation,
+                                pregrasp_index=index, hand_mode=mode)
+                    return (transit, approach, lift_path), (pregrasp, goal, lift), clearances, info
     raise PlanningFailure(bool(attempted), best)
 
 
-def simulate(trial, paths, targets, home, opposed):
+def simulate(trial, paths, targets, home, opposed, preshape=None):
+    """Run the planned motion. ``preshape`` maps flange distance to the goal onto hand angles
+    until closing starts; without it the hand stays open as before."""
     model, data = trial.model, trial.data
     transit, approach, lift = paths
     _, goal, _ = targets
@@ -442,6 +565,16 @@ def simulate(trial, paths, targets, home, opposed):
     data.ctrl[trial.arm_ctrl] = home
     data.ctrl[trial.hand_ctrl] = trial.open_angles
     mujoco.mj_forward(model, data)
+
+    def approach_hand():
+        if preshape is None:
+            return trial.open_angles
+        return preshape(float(np.linalg.norm(data.xpos[trial.flange] - goal[:3, 3])))
+
+    if preshape is not None:
+        trial.set_hand(approach_hand())
+        data.ctrl[trial.hand_ctrl] = approach_hand()
+        mujoco.mj_forward(model, data)
     initial_cup = data.xpos[trial.cup].copy()
     transit_duration = np.ceil(FPS * max(2.4, 2 * np.max(np.abs(transit(1.) - home)))) / FPS
     transit_step, approach_step, close_step, lift_step, hold_step = np.cumsum([
@@ -485,8 +618,12 @@ def simulate(trial, paths, targets, home, opposed):
             arm_goal = transit(smooth((t - times['Transit']) / (times['Approach'] - times['Transit'])))
 
         data.ctrl[trial.arm_ctrl] = arm_goal
-        fraction = smooth((t - times['Close'] - .22) / .83)
-        data.ctrl[trial.hand_ctrl] = trial.open_angles + fraction * (trial.close_angles - trial.open_angles)
+        if step < close_step:
+            hand_goal = approach_hand()
+        else:
+            fraction = smooth((t - times['Close'] - .22) / .83)
+            hand_goal = trial.open_angles + fraction * (trial.close_angles - trial.open_angles)
+        data.ctrl[trial.hand_ctrl] = hand_goal
         mujoco.mj_step(model, data)
         max_joint_speed = np.maximum(max_joint_speed, np.abs(data.qvel[trial.arm_dof]))
         arm_q = data.qpos[trial.arm_q]
@@ -527,7 +664,8 @@ def simulate(trial, paths, targets, home, opposed):
                 held_reference = relative
             hold.append((height, tilt, touching, np.linalg.norm(relative - held_reference)))
         if frame is not None:
-            frames.append((frame, t, height, phase, forces.get('thumb', 0.), forces.get(opposed, 0.), arm_goal.copy()))
+            frames.append((frame, t, height, phase, forces.get('thumb', 0.), forces.get(opposed, 0.), arm_goal.copy(),
+                           np.array(hand_goal, dtype=float)))
 
     minimum, tilt, fraction, slip = np.asarray(hold).T
     checks = {
@@ -569,8 +707,20 @@ def run(cli):
         home = np.array(cli.home)
         if np.any(home < trial.bounds[0]) or np.any(home > trial.bounds[1]):
             raise ValueError('The home pose exceeds xArm7 joint limits')
-        paths, targets, clearances = plan(trial, grasp['T_scene_flange'], home)
-        stats, frames = simulate(trial, paths, targets, home, str(grasp['contact_fingers'][1]))
+        preshape = flowhoi_preshape(grasp) if cli.preshape == 'flowhoi' else None
+        object_pose = grasp['T_scene_object']
+
+        def attempt(yaw):
+            object_flange = about_object_axis(yaw) @ grasp['T_object_flange']
+            approach_dir = None
+            if cli.approach == 'flowhoi':
+                approach_dir = flowhoi_approach(grasp, object_pose @ about_object_axis(yaw))
+            return plan(trial, object_pose @ object_flange, home, approach_dir=approach_dir, preshape=preshape)
+
+        paths, targets, clearances, choice = plan_over_symmetry(attempt, cli.object_symmetry)
+        approach_dir = flowhoi_approach(grasp, np.eye(4)) if cli.approach == 'flowhoi' else None
+        used_preshape = preshape if choice['hand_mode'] == 'flowhoi' else None
+        stats, frames = simulate(trial, paths, targets, home, str(grasp['contact_fingers'][1]), used_preshape)
         stats.update(model='xArm7 + RH56F1', replay_title='xArm7 cup lift', grasp_frame=cli.frame,
                      source_lift=str(source), contact_fingers=stage2['contact_fingers'],
                      cup_mass_kg=stage2['cup_mass_kg'], sliding_friction=stage2['sliding_friction'],
@@ -578,12 +728,15 @@ def run(cli):
                      planned_minimum_clearance_m=dict(zip(('transit', 'approach', 'lift'),
                                                           (d for d, _ in clearances))),
                      base_pose_scene=base.tolist(),
-                     camera=dict(distance=1.46, azimuth=122, elevation=-27))
-        qpos, times, height, phase, thumb, other, commanded = zip(*frames)
+                     camera=dict(distance=1.46, azimuth=122, elevation=-27),
+                     flowhoi_approach_available=approach_dir is not None,
+                     flowhoi_preshape_available=preshape is not None, **choice)
+        qpos, times, height, phase, thumb, other, commanded, hand_commanded = zip(*frames)
         np.savez_compressed(staging / 'lift_replay.npz', qpos=qpos, fps=FPS, time_s=times,
                             cup_height_m=height, phase=phase, thumb_force_n=thumb, opposing_force_n=other)
         np.savez_compressed(staging / 'xarm7_path.npz', time_s=times, phase=phase, joint_names=ARM_NAMES,
                             q_target_rad=commanded, q_actual_rad=np.array(qpos)[:, trial.arm_q],
+                            hand_joint_names=grasp['joint_names'], q_hand_target_rad=hand_commanded,
                             T_scene_base=base, T_scene_pregrasp=targets[0], T_scene_grasp=targets[1],
                             T_scene_lift=targets[2], source_frame=cli.frame)
         start = trial.open_qpos.copy()
@@ -611,6 +764,7 @@ def main():
     add_arm_model_arguments(parser)
     parser.add_argument('--base-xy', type=float, nargs=2, help='xArm7 base position in scene metres')
     parser.add_argument('--home', type=float, nargs=7, default=HOME, help='Home arm angles in radians')
+    add_flowhoi_motion_arguments(parser)
     cli = parser.parse_args()
     if cli.output_dir.exists():
         parser.error('Use a new output directory')

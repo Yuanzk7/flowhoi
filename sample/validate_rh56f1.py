@@ -18,15 +18,80 @@ from scipy.spatial.transform import Rotation
 import trimesh
 
 from sample import rh56f1_retarget
+from sample.grasp_interface import palm_deviation, spec_from_grasp_archive
 
 
 DEFAULT_MJCF = rh56f1_retarget.DEFAULT_URDF.with_name('right.xml')
 FINGERS = ('thumb', 'index', 'middle', 'ring', 'little')
+OPPOSING = ('index', 'middle', 'ring')
+LEGACY_OPPOSING = ('middle', 'index', 'ring')
 FPS = 30
 DT = 1 / 600
 LIFT_HEIGHT = .075
 MIN_HEIGHT = .050
 HOLD_SECONDS = 2.
+MAX_PALM_ROTATION_DEG = 30.
+MAX_PALM_FLEXION_DEG = 60.
+MAX_PALM_OFFSET_M = .04
+# Opposing seeds are generated over a roll grid; seeds this far beyond the rotation budget
+# cannot be pulled back by refinement and are dropped before the expensive steps.
+SEED_ROTATION_SLACK_DEG = 15.
+# The arm wrist (xArm link6/link7) sits behind the flange along -z, out to about 135 mm. This
+# lift rig has no arm, so it is approximated as a segment of that length and radius that must
+# stay above the table. The xArm7 validation is the authoritative check.
+WRIST_SEGMENT_M = .10
+WRIST_RADIUS_M = .06
+WRIST_TABLE_MARGIN_M = .005
+
+
+def wrist_table_clearance(flange_world, table_z):
+    """Lowest point of the approximated arm wrist above the table, in metres."""
+    lowest = min(flange_world[2, 3], flange_world[2, 3] - WRIST_SEGMENT_M * flange_world[2, 2])
+    return float(lowest - WRIST_RADIUS_M - table_z)
+
+
+class PalmPrior:
+    """Human palm pose that the robot palm should stay near, with an acceptance budget.
+
+    Rotation is split into wrist flexion (about the palm lateral axis) and the rest, which
+    holds the palm facing direction and the side the fingers wrap from.
+    """
+
+    def __init__(self, human_palm, flange_palm, scale=1., max_rotation_deg=MAX_PALM_ROTATION_DEG,
+                 max_offset_m=MAX_PALM_OFFSET_M, max_flexion_deg=MAX_PALM_FLEXION_DEG):
+        self.human_palm = human_palm
+        self.flange_palm = flange_palm
+        self.scale = scale
+        self.max_rotation_deg = max_rotation_deg
+        self.max_flexion_deg = max_flexion_deg
+        self.max_offset_m = max_offset_m
+
+    def initial_flange(self):
+        return self.human_palm @ np.linalg.inv(self.flange_palm)
+
+    def deviation(self, flange):
+        return palm_deviation(self.human_palm, flange @ self.flange_palm)
+
+    def rotation_parts(self, flange):
+        """(flexion, other) rotation from the human palm in degrees."""
+        palm = flange @ self.flange_palm
+        rotvec = np.rad2deg(Rotation.from_matrix(self.human_palm[:3, :3].T @ palm[:3, :3]).as_rotvec())
+        return float(abs(rotvec[1])), float(np.linalg.norm(rotvec[[0, 2]]))
+
+    def within(self, flange, slack_deg=0.):
+        offset, _ = self.deviation(flange)
+        flexion, other = self.rotation_parts(flange)
+        return (other <= self.max_rotation_deg + slack_deg and flexion <= self.max_flexion_deg + slack_deg
+                and np.linalg.norm(offset) <= self.max_offset_m)
+
+    def residual(self, flange):
+        return rh56f1_retarget.palm_prior_residual(flange, self.flange_palm, self.human_palm, self.scale)
+
+
+def opposing_order(human_contacts):
+    """Try the digits the human used first, keeping the remaining ones as fallbacks."""
+    used = {name.replace('pinky', 'little') for name in human_contacts}
+    return tuple(f for f in OPPOSING if f in used) + tuple(f for f in OPPOSING if f not in used)
 
 
 def load_retarget(path=None):
@@ -291,7 +356,7 @@ def patch_angle(thumb, opposed):
     return float(np.dot(a, b) / max(1e-6, np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def refine_grasp(trial, flange, q, tips, opposed, grip_height, targets=None):
+def refine_grasp(trial, flange, q, tips, opposed, grip_height, targets=None, prior=None):
     base_r, base_p = flange[:3, :3].copy(), flange[:3, 3].copy()
     scale = np.array([.025] * 3 + [.45] * 3 + [.55] * 6)
 
@@ -318,6 +383,9 @@ def refine_grasp(trial, flange, q, tips, opposed, grip_height, targets=None):
             .45 * (np.array([thumb[2], other[2]]) - grip_height),
             [] if targets is None else (.65 * (np.stack((thumb, other)) - targets)).ravel(),
             x[3:6] * .0015,
+            [] if prior is None else prior.residual(target),
+            [] if prior is None else [5. * min(wrist_table_clearance(trial.object_pose @ target, trial.table_z)
+                                               - WRIST_TABLE_MARGIN_M, 0.)],
         ]
 
     def jacobian(x):
@@ -441,7 +509,7 @@ def candidate_controls(trial, flange, q, opposed):
             yield initial, command
 
 
-def opposing_seeds(trial, retarget, tips, finger, height):
+def opposing_seeds(trial, retarget, tips, finger, height, prior=None):
     index = FINGERS.index(finger)
     hand_model = trial.robot.HandModel()
     base_rotation = retarget.T_object_flange[:3, :3]
@@ -471,6 +539,13 @@ def opposing_seeds(trial, retarget, tips, finger, height):
             for roll in (-65., -35., -10., 15., 40., 65.):
                 rotation = Rotation.from_rotvec(axis * np.deg2rad(roll)).as_matrix() @ align.as_matrix() @ base_rotation
                 flange = transform(rotation, targets.mean(axis=0) - rotation @ points.mean(axis=0))
+                palm_angle = 0.
+                if prior is not None:
+                    flexion, palm_angle = prior.rotation_parts(flange)
+                    if (palm_angle > prior.max_rotation_deg + SEED_ROTATION_SLACK_DEG
+                            or flexion > prior.max_flexion_deg + SEED_ROTATION_SLACK_DEG
+                            or wrist_table_clearance(trial.object_pose @ flange, trial.table_z) < -.02):
+                        continue
                 trial.static(flange, q)
                 cup = trial.distances(trial.hand_geoms, trial.cup_geom)
                 floor = trial.distances(trial.hand_geoms, trial.table_geom)
@@ -478,25 +553,29 @@ def opposing_seeds(trial, retarget, tips, finger, height):
                 finger_d, patch = trial.contact_patch(finger)
                 score = (abs(thumb_d) + abs(finger_d) + 3 * max(0., -.0005 - cup.min())
                          + 3 * max(0., .002 - floor.min())
-                         + np.linalg.norm(np.stack((thumb, patch)) - targets))
+                         + np.linalg.norm(np.stack((thumb, patch)) - targets)
+                         + .03 * np.deg2rad(palm_angle))
                 seeds.append((score, flange, q, targets))
     seeds.sort(key=lambda seed: seed[0])
     return seeds[:4]
 
 
-def solve(trial, tips, joints):
+def solve(trial, tips, joints, prior=None, fingers=LEGACY_OPPOSING):
+    """Fit a thumb + one-finger RH56F1 grasp; with ``prior`` the palm stays within its budget."""
     robot = trial.robot
-    first = seed_flange(joints)
+    first = seed_flange(joints) if prior is None else prior.initial_flange()
     joint_seed = np.array([1.2, .20, .7, .7, .7, .7])
     profile = robot.radial_profile(trial.hull_points)
-    retarget = robot.retarget(robot.HandModel(), tips, first, joint_seed, profile=profile, pose_weight=.015)
+    extra = {} if prior is None else dict(palm_prior=(prior.human_palm, prior.flange_palm),
+                                          palm_prior_scale=prior.scale)
+    retarget = robot.retarget(robot.HandModel(), tips, first, joint_seed, profile=profile, pose_weight=.015, **extra)
     print(f'URDF seed mean fingertip error {np.mean(retarget.tip_error) * 1000:.1f} mm', flush=True)
 
     best = None
     def candidates():
-        for finger in ('middle', 'index', 'ring'):
+        for finger in fingers:
             grasp_z = float(np.mean(tips[[0, FINGERS.index(finger)], 2]) + .018)
-            for _, flange, q, targets in opposing_seeds(trial, retarget, tips, finger, grasp_z):
+            for _, flange, q, targets in opposing_seeds(trial, retarget, tips, finger, grasp_z, prior):
                 yield finger, flange, q, grasp_z, targets
             for yaw in (0., -24., 24.):
                 rotate = Rotation.from_euler('z', yaw, degrees=True).as_matrix()
@@ -505,15 +584,28 @@ def solve(trial, tips, joints):
                 yield finger, flange, retarget.joints, grasp_z, None
 
     for index, (finger, flange, q, grasp_z, targets) in enumerate(candidates()):
-        flange, q = refine_grasp(trial, flange, q, tips, finger, grasp_z, targets)
+        flange, q = refine_grasp(trial, flange, q, tips, finger, grasp_z, targets, prior)
         trial.static(flange, q)
         thumb_d, thumb = trial.contact_patch('thumb')
         other_d, other = trial.contact_patch(finger)
         angle = np.rad2deg(np.arccos(np.clip(patch_angle(thumb, other), -1, 1)))
         table_clearance = float(trial.distances(trial.hand_geoms, trial.table_geom).min())
+        palm = ''
+        if prior is not None:
+            offset, _ = prior.deviation(flange)
+            flexion, other_rotation = prior.rotation_parts(flange)
+            wrist = wrist_table_clearance(trial.object_pose @ flange, trial.table_z)
+            palm = (f', palm offset {np.linalg.norm(offset) * 1000:.0f} mm, flexion {flexion:.0f} deg, '
+                    f'other rotation {other_rotation:.0f} deg, arm wrist clearance {wrist * 1000:.0f} mm')
         print(f'Fit {index + 1}, thumb + {finger}: distances {thumb_d * 1000:.1f}, {other_d * 1000:.1f} mm, '
-              f'opposition {angle:.0f} deg, table clearance {table_clearance * 1000:.1f} mm', flush=True)
+              f'opposition {angle:.0f} deg, table clearance {table_clearance * 1000:.1f} mm{palm}', flush=True)
         if max(abs(thumb_d), abs(other_d)) > .003 or angle < 120 or table_clearance < .0005:
+            continue
+        if prior is not None and not prior.within(flange):
+            print('  Rejected: palm outside the FlowHOI deviation budget', flush=True)
+            continue
+        if prior is not None and wrist < WRIST_TABLE_MARGIN_M:
+            print('  Rejected: the arm wrist would reach the table', flush=True)
             continue
         for initial, command in candidate_controls(trial, flange, q, finger):
             result, _ = simulate(trial, flange, initial, command, finger)
@@ -527,7 +619,10 @@ def solve(trial, tips, joints):
             if result['passed']:
                 return best[1:]
     if best is None:
-        raise ValueError('No RH56F1 pose satisfied static opposition, clearance and opening checks')
+        budget = '' if prior is None else (f' within the palm budget ({prior.max_rotation_deg:g} deg rotation, '
+                                           f'{prior.max_flexion_deg:g} deg flexion, '
+                                           f'{prior.max_offset_m * 1000:g} mm) with arm wrist clearance')
+        raise ValueError(f'No RH56F1 pose satisfied static opposition, clearance and opening checks{budget}')
     return best[1:]
 
 
@@ -553,7 +648,24 @@ def run(cli):
         if fk_error >= .001:
             raise ValueError(f'RH56F1 MJCF and URDF tip positions disagree by {fk_error * 1000:.2f} mm')
 
-        flange, pose, initial, command, finger = solve(trial, tips, joints)
+        spec = spec_from_grasp_archive(cli.grasp, cli.frame)
+        flange_palm = rh56f1_retarget.palm_in_flange(robot.HandModel())
+        human_palm = spec['T_object_palm']
+        human_contacts = tuple(str(name) for name in spec['contact_fingers'])
+        if cli.retarget_mode == 'palm':
+            prior = PalmPrior(human_palm, flange_palm, cli.palm_prior_scale,
+                              cli.max_palm_rotation_deg, cli.max_palm_offset_m, cli.max_palm_flexion_deg)
+            fingers = opposing_order(human_contacts)
+        else:
+            prior, fingers = None, LEGACY_OPPOSING
+        print(f'Human contacts {list(human_contacts)}; retarget mode {cli.retarget_mode}', flush=True)
+        flange, pose, initial, command, finger = solve(trial, tips, joints, prior, fingers)
+        palm_offset, palm_angle = palm_deviation(human_palm, flange @ flange_palm)
+        flexion, other_rotation = PalmPrior(human_palm, flange_palm).rotation_parts(flange)
+        wrist_clearance = wrist_table_clearance(obj @ flange, table_z)
+        # Carry the approach over in the palm frame so it follows any residual palm rotation.
+        robot_palm = flange @ flange_palm
+        approach = robot_palm[:3, :3] @ spec['approach_dir_palm'] if spec['approach_valid'] else np.zeros(3)
         trial.static(flange, pose)
         tip_errors = np.linalg.norm(trial.fingertip_positions() - tips, axis=-1)
         thumb_d, thumb = trial.contact_patch('thumb')
@@ -567,7 +679,14 @@ def run(cli):
                             q_open_rad=initial, q_close_command_rad=command, joint_names=robot.ACTUATED,
                             human_tips_object_m=tips, robot_tips_object_m=trial.fingertip_positions(),
                             tip_error_m=tip_errors, contact_fingers=('thumb', finger),
-                            contact_points_object_m=np.stack((thumb, other)))
+                            contact_points_object_m=np.stack((thumb, other)),
+                            retarget_mode=cli.retarget_mode, human_contact_fingers=np.array(human_contacts, dtype='<U6'),
+                            T_object_palm_human=human_palm, T_flange_palm=flange_palm,
+                            palm_offset_m=palm_offset, palm_rotation_deg=palm_angle,
+                            approach_valid=spec['approach_valid'], approach_dir_object=approach,
+                            approach_dir_human_object=spec['approach_dir_object'],
+                            preshape_remaining_m=spec['remaining_m'], preshape=spec['preshape'],
+                            q_preshape_wide_rad=rh56f1_retarget.preshape_joints(initial, 1.))
         stats, samples = simulate(trial, flange, initial, command, finger, record=True)
         stats.update(grasp_frame=cli.frame, source=str(cli.grasp.resolve()),
                      model='RH56F1 with actuated wrist height rig', cup_mass_kg=cli.cup_mass,
@@ -576,7 +695,19 @@ def run(cli):
                      static_opposition_deg=float(np.rad2deg(np.arccos(np.clip(patch_angle(thumb, other), -1, 1)))),
                      static_mean_tip_error_m=float(tip_errors.mean()), static_table_clearance_m=table_clearance,
                      opening_cup_clearance_m=opening_clearance, urdf_mjcf_tip_error_m=fk_error,
-                     requested_wrist_lift_m=LIFT_HEIGHT, physics_timestep_s=DT)
+                     requested_wrist_lift_m=LIFT_HEIGHT, physics_timestep_s=DT,
+                     retarget_mode=cli.retarget_mode, human_contact_fingers=list(human_contacts),
+                     palm_offset_from_human_m=palm_offset.tolist(),
+                     palm_offset_norm_m=float(np.linalg.norm(palm_offset)),
+                     palm_rotation_from_human_deg=palm_angle,
+                     palm_flexion_from_human_deg=flexion, palm_other_rotation_from_human_deg=other_rotation,
+                     approx_arm_wrist_table_clearance_m=wrist_clearance,
+                     palm_budget=None if prior is None else dict(max_rotation_deg=prior.max_rotation_deg,
+                                                                 max_flexion_deg=prior.max_flexion_deg,
+                                                                 max_offset_m=prior.max_offset_m,
+                                                                 prior_scale=prior.scale),
+                     approach_from_flowhoi=bool(spec['approach_valid']),
+                     preshape_amplitude_m=float(np.ptp(spec['aperture_m'])))
         hand.set('pos', text(trial.model.body_pos[trial.hand]))
         hand.set('quat', text(trial.model.body_quat[trial.hand]))
         initial_state = trial.model.qpos0.copy()
@@ -604,10 +735,25 @@ def main():
     parser.add_argument('--retarget-module', type=Path, help='Override the bundled RH56F1 retarget module')
     parser.add_argument('--cup-mass', type=float, default=.06, help='Simulated cup mass in kg')
     parser.add_argument('--friction', type=float, default=.65, help='Simulated cup and finger sliding friction')
+    parser.add_argument('--retarget-mode', choices=('palm', 'legacy'), default='palm',
+                        help='palm: keep the robot palm near the FlowHOI palm within a budget and try the '
+                             "human's contact digits first. legacy: the previous unconstrained search")
+    parser.add_argument('--max-palm-rotation-deg', type=float, default=MAX_PALM_ROTATION_DEG,
+                        help='Reject robot palms rotated further than this from the human palm, '
+                             'excluding wrist flexion')
+    parser.add_argument('--max-palm-flexion-deg', type=float, default=MAX_PALM_FLEXION_DEG,
+                        help='Reject robot palms flexed further than this about the human palm lateral axis')
+    parser.add_argument('--max-palm-offset-m', type=float, default=MAX_PALM_OFFSET_M,
+                        help='Reject robot palms whose origin is further than this from the human palm')
+    parser.add_argument('--palm-prior-scale', type=float, default=1.,
+                        help='Strength of the palm pose cost during fitting (0 keeps only the budget)')
     parser.add_argument('--output-dir', type=Path, required=True)
     cli = parser.parse_args()
     if not np.isfinite([cli.cup_mass, cli.friction]).all() or cli.cup_mass <= 0 or cli.friction <= 0:
         parser.error('Cup mass and friction must be finite and positive')
+    limits = (cli.max_palm_rotation_deg, cli.max_palm_offset_m, cli.max_palm_flexion_deg, cli.palm_prior_scale)
+    if not np.isfinite(limits).all() or min(limits[:3]) <= 0 or cli.palm_prior_scale < 0:
+        parser.error('Palm budget must be positive and the prior scale nonnegative')
     if cli.output_dir.exists():
         parser.error('Use a new output directory')
     try:

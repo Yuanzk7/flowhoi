@@ -110,10 +110,47 @@ class Result:
     max_penetration: float
 
 
+PALM_FINGERS = ("index", "middle", "ring", "little")
+# Palm prior weights per metre along the human palm axes (x palm normal, y lateral, z finger
+# direction) and per radian of rotation about those axes. The palm normal offset is the
+# loosest: the robot hand is thicker and its fingers have different lengths, so it may stand
+# off further. Rotation about the lateral axis (wrist flexion, i.e. finger elevation) is weak
+# because it mostly reflects the human forearm posture, which the arm may not be able to copy.
+PALM_POSITION_WEIGHTS = np.array([0.6, 1.5, 1.0])
+PALM_ROTATION_WEIGHTS = np.array([0.12, 0.03, 0.12])
+
+
+def palm_in_flange(model: HandModel) -> np.ndarray:
+    """Palm frame of the open hand in the flange frame, defined like grasp_interface.palm_frame.
+
+    Origin at the mean of the four finger base joints, +z along the flange axis (the finger
+    direction of the open hand), +y from the little to the index finger base.
+    """
+    from sample.grasp_interface import frame_from_axes
+
+    q = np.zeros(len(ACTUATED))
+    bases = {name: model.link(f"right_{name}_1", q) for name in PALM_FINGERS}
+    return frame_from_axes(np.mean(list(bases.values()), axis=0), bases["index"] - bases["little"],
+                           np.array([0.0, 0.0, 1.0]))
+
+
+def palm_prior_residual(flange: np.ndarray, flange_palm: np.ndarray, human_palm: np.ndarray,
+                        scale: float = 1.0) -> np.ndarray:
+    """Weighted robot-to-human palm deviation in the human palm frame (6 terms)."""
+    palm = flange @ flange_palm
+    offset = human_palm[:3, :3].T @ (palm[:3, 3] - human_palm[:3, 3])
+    rotation = Rotation.from_matrix(human_palm[:3, :3].T @ palm[:3, :3]).as_rotvec()
+    return scale * np.r_[PALM_POSITION_WEIGHTS * offset, PALM_ROTATION_WEIGHTS * rotation]
+
+
 def retarget(model: HandModel, human_tips: np.ndarray, initial_flange: np.ndarray, initial_joints: np.ndarray,
              profile=None, tip_weights=(2.0, 1.0, 1.0, 1.0, 1.0), penetration_weight: float = 5.0,
-             pose_weight: float = 0.02) -> Result:
-    """human_tips are ordered thumb to little, in the object frame, in metres."""
+             pose_weight: float = 0.02, palm_prior=None, palm_prior_scale: float = 1.0) -> Result:
+    """human_tips are ordered thumb to little, in the object frame, in metres.
+
+    ``palm_prior`` is an optional (T_object_palm_human, T_flange_palm_robot) pair that keeps the
+    robot palm near the human palm while the fingertips are matched.
+    """
     human_tips = np.asarray(human_tips, dtype=float)
     weights = np.asarray(tip_weights, dtype=float)[:, None]
     start = np.concatenate([initial_flange[:3, 3], Rotation.from_matrix(initial_flange[:3, :3]).as_rotvec(),
@@ -127,6 +164,9 @@ def retarget(model: HandModel, human_tips: np.ndarray, initial_flange: np.ndarra
         terms = [(weights * (world(transform, model.tips(q)) - human_tips)).ravel(), pose_weight * (x[6:] - start[6:])]
         if profile is not None:
             terms.append(penetration_weight * penetration(world(transform, model.surface_points(q)), profile))
+        if palm_prior is not None:
+            human_palm, flange_palm = palm_prior
+            terms.append(palm_prior_residual(transform, flange_palm, human_palm, palm_prior_scale))
         return np.concatenate(terms)
 
     lower = np.concatenate([np.full(6, -np.inf), np.zeros(6)])
@@ -136,6 +176,18 @@ def retarget(model: HandModel, human_tips: np.ndarray, initial_flange: np.ndarra
     tips = world(transform, model.tips(q))
     depth = 0.0 if profile is None else float(penetration(world(transform, model.surface_points(q)), profile).max())
     return Result(transform, q, tips, np.linalg.norm(tips - human_tips, axis=1), depth)
+
+
+def preshape_joints(q_open: np.ndarray, amount) -> np.ndarray:
+    """Open the flexion joints of ``q_open`` toward zero by ``amount`` in [0, 1].
+
+    Thumb rotation (index 0) is kept so the thumb stays in the same opposition plane while the
+    fingers open; zero flexion is the fully open hand.
+    """
+    amount = np.clip(np.asarray(amount, dtype=float), 0.0, 1.0)
+    q = np.array(q_open, dtype=float) * np.ones(np.shape(amount) + (len(ACTUATED),))
+    q[..., 1:] *= (1.0 - amount)[..., None]
+    return q
 
 
 def joints_to_raw(q: np.ndarray) -> np.ndarray:

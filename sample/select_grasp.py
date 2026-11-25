@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation
 
 from sample.grasp_geometry import (FINGERS, REFLECT_X, ManoHand, MeshDistance, decode_hand,
                                    feature, load_mesh, object_coordinates, rotation_matrix)
+from sample.grasp_interface import save_spec, spec_from_grasp_archive
 from sample.sample_grasp import GRAB_DATA, GRASP_FRAMES, HAND_CHANNELS, save_npz
 from utils.mesh_to_bps import encode_object_bps, load_object_basis
 
@@ -189,7 +190,12 @@ def evaluate(cli):
                      joint_signed_distance=best_joint_distances, predicted_joint_distance=best_hand.predicted_distance,
                      object_pose=object_pose, frame_index=np.arange(GRASP_FRAMES),
                      object_mesh=str(cli.mesh.resolve()), source_archive=best['source'], source_index=best['index'],
-                     seed=best['seed'], mirrored=best['mirrored'])
+                     seed=best['seed'], mirrored=best['mirrored'],
+                     finger_distance_m=np.asarray(best['right_finger_distances_m'])[-1],
+                     contact_radius_m=thresholds['contact_distance_m'])
+            # The robot-agnostic description a retargeting step consumes (see grasp_interface).
+            save_spec(bundle / 'grasp_spec.npz', spec_from_grasp_archive(bundle / 'right_hand_grasp.npz'),
+                      source_grasp='right_hand_grasp.npz')
         bundle.rename(output)
     count = sum(row['passed'] for row in records)
     print(f'{count}/{len(records)} candidates passed. Evaluation report: {output / "report.json"}')

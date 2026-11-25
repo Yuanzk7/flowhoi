@@ -225,6 +225,22 @@ python -m sample.select_grasp \
     --object-on-table --output-dir outputs/custom_grasp/selection
 ```
 
+`fit_cup_grasp`는 생성된 파지의 엄지 방위각에서 탐색을 시작하고(`--yaw-source model`),
+생성된 접근 궤적을 보정된 최종 파지에 맞게 강체 이동해 사용합니다(`--approach model`).
+이동한 궤적이 검사를 통과하지 못하면 합성 접근으로 대체하며, 어느 쪽을 썼는지와
+모델 대비 손바닥 편차가 `metrics_json`에 기록됩니다. 이전 동작은
+`--yaw-source legacy --approach synth`입니다.
+
+`select_grasp`는 `right_hand_grasp.npz`와 함께 로봇 무관 중간 표현
+`grasp_spec.npz`를 저장합니다(`sample/grasp_interface.py`):
+
+| 항목 | 의미 |
+|---|---|
+| `T_object_palm` | 물체 좌표계 손바닥 포즈. 원점은 MCP 4개 평균, +z 손목→중지 MCP, +y 새끼→검지 MCP |
+| `contact_fingers`, `finger_distance_m` | 최종 프레임 접촉 손가락과 손가락별 표면 거리 |
+| `approach_dir_object`, `approach_dir_palm` | 마지막 15프레임의 손바닥 이동 방향 (물체/손바닥 좌표계) |
+| `remaining_m`, `preshape` | 프레임별 남은 손바닥 경로 길이와 정규화 개구도(1 최대, 0 최종 파지) |
+
 ### MuJoCo에서 Stage 1 궤적 재생
 
 ```bash
@@ -255,6 +271,21 @@ python outputs/custom_grasp/rh56f1_lift/replay.py \
     --video outputs/custom_grasp/rh56f1_lift/lift.mp4
 ```
 
+기본값 `--retarget-mode palm`은 RH56F1 URDF의 손가락 기저 관절로 같은 규칙의 손바닥
+좌표계를 정의해 사람 손바닥에 맞춰 시작하고, 손바닥 포즈 비용을 걸고, 사람이 접촉한
+손가락을 대향 손가락으로 먼저 시도합니다. 다음 허용 범위를 벗어난 해는 기각합니다.
+
+| 옵션 | 기본값 | 의미 |
+|---|---|---|
+| `--max-palm-rotation-deg` | 30 | 손목 굽힘을 제외한 회전 |
+| `--max-palm-flexion-deg` | 60 | 손바닥 측면축 회전(손목 굽힘). 사람 팔 자세를 따르기 어려워 넓게 둠 |
+| `--max-palm-offset-m` | 0.04 | 손바닥 원점 거리 |
+| `--palm-prior-scale` | 1 | 손바닥 비용 강도 (0이면 허용 범위만 적용) |
+
+팔 손목(xArm link6/link7)을 플랜지 뒤 10 cm, 반경 6 cm 원기둥으로 근사해 테이블에서
+5 mm 이상 떨어지도록 하는 제약도 함께 걸립니다. 결과의 `palm_*_from_human_*` 항목이
+사람 손바닥 대비 편차입니다. 이전 동작은 `--retarget-mode legacy`입니다.
+
 ### xArm7 접근·파지·리프트 검증
 
 ```bash
@@ -269,6 +300,20 @@ python outputs/custom_grasp/xarm7_lift/replay.py
 python outputs/custom_grasp/xarm7_lift/replay.py \
     --video outputs/custom_grasp/xarm7_lift/lift.mp4
 ```
+
+`--approach flowhoi`(기본값)는 FlowHOI 손바닥 이동 방향의 반대쪽 8 cm에 프리그래스프를
+두고, 실패하면 수직축 기준 ±50°까지 돌린 방향, 그다음 기존 플랜지 축 방향을 시도합니다.
+`--preshape flowhoi`(기본값)는 플랜지와 파지 위치 사이의 남은 거리에 맞춰 FlowHOI
+개구도 곡선대로 손가락을 열고(엄지 회전은 유지), 충돌 검사에도 그 손 상태를 씁니다.
+통과하지 못하면 열린 손으로 대체합니다. 선택 결과는 `lift_metrics.json`의
+`approach_source`, `approach_deviation_deg`, `hand_mode`에, 손 명령 궤적은
+`xarm7_path.npz`의 `q_hand_target_rad`에 기록됩니다. 이전 동작은
+`--approach flange --preshape open`입니다.
+
+손잡이 없는 컵처럼 +z축 대칭인 물체는 `--object-symmetry z`를 주면, 팔이 닿지 않을 때
+파지와 접근 방향 전체를 물체 축 기준 30° 간격으로 돌려 다시 계획합니다. 사용한 각도는
+`grasp_axis_rotation_deg`에 기록됩니다. 사전검사(`preflight_xarm7_rh56f1`)도 같은
+`--approach`, `--preshape`, `--object-symmetry` 옵션을 받습니다.
 
 ### 실기 사전검사
 

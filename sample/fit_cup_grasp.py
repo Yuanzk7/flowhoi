@@ -12,6 +12,7 @@ from torch.nn import functional as F
 import trimesh
 
 from sample.grasp_geometry import ManoHand, MeshDistance, decode_hand, feature, load_mesh
+from sample.grasp_interface import palm_deviation, palm_frame
 from sample.sample_grasp import GRAB_DATA, GRASP_FRAMES, HAND_CHANNELS, save_npz
 from sample.select_grasp import get_thresholds, measure, read_archive
 from utils.mesh_to_bps import encode_object_bps, load_object_basis
@@ -19,6 +20,9 @@ from utils.rotation_conversions import quaternion_to_matrix
 
 
 MIN_OPPOSITION_DEG = 120
+MODEL_YAW_DELTAS_DEG = (0, 20, -20, 40, -40, 65, -65, 90, -90, 135, -135, 180)
+METHODS = {'model': 'FlowHOI trajectory moved to the fitted cup grasp',
+           'synth': 'Geometry-fitted cup approach (synthesized)'}
 
 
 def unit(vector):
@@ -197,6 +201,42 @@ def approach(source, hands, goal, table_z, stand_off, center):
     return motion
 
 
+def follow_model(source, hands, goal, table_z):
+    """Move the model's own right-hand trajectory rigidly so it ends at the fitted grasp.
+
+    The palm-relative approach direction and the timing of the hand opening and closing are
+    FlowHOI's; only the final pose is corrected, with the finger shape blended in over time.
+    """
+    right, left = source['right'], source['left']
+    goal_wrist, goal_rot, goal_pca = goal
+    frames = len(right.wrist)
+    correction = goal_rot @ right.rotation[-1].T
+    wrist = ((right.wrist - right.wrist[-1]) @ correction.T + goal_wrist).astype(np.float32)
+    rotation = (correction @ right.rotation).astype(np.float32)
+    source_pca = as_pca(right, hands['right'])
+    ramp = smoothstep(np.linspace(0, 1, frames))
+    pca = (source_pca + ramp[:, None] * (goal_pca - source_pca[-1])).astype(np.float32)
+
+    left_pca = as_pca(left, hands['left'])
+    left_wrist = lift_to_table(left.wrist, left.rotation, left_pca, hands['left'], table_z, left.predicted_distance)
+    proposed = hands['right'].fk(wrist, rotation, pca @ hands['right'].components, right.predicted_distance)
+    wrist[:, 2] += np.maximum(table_z + .002 - proposed.vertices[..., 2].min(axis=1), 0)
+    motion = np.zeros((frames, HAND_CHANNELS), dtype=np.float32)
+    put_hand(motion, 'right', wrist, rotation, pca, right.predicted_distance)
+    put_hand(motion, 'left', left_wrist, left.rotation, left_pca, left.predicted_distance)
+    return motion
+
+
+def start_yaw(offset, model_yaw):
+    """Thumb contact azimuth for a fitting start: near the model's own grasp first, or the
+    original golden-angle spread when ``model_yaw`` is None."""
+    golden = np.pi * (3 - np.sqrt(5))
+    if model_yaw is None:
+        return offset * golden
+    return model_yaw + np.deg2rad(MODEL_YAW_DELTAS_DEG[offset % len(MODEL_YAW_DELTAS_DEG)]) \
+        + (offset // len(MODEL_YAW_DELTAS_DEG)) * golden
+
+
 def opposed_contact_angles(vertices, hand, distance, center, radius):
     """Find the most opposed simultaneous thumb and finger contacts in each frame."""
     signed = distance.signed(vertices)
@@ -298,9 +338,53 @@ def fit_grasp(cli):
                 np.repeat(np.eye(3, dtype=np.float32)[None], GRASP_FRAMES, axis=0))
     thresholds, _ = get_thresholds(cli)
     solver = PoseFit(hands['right'], field, envelope, table_z)
+    model_palm = palm_frame(raw.joints[0])
+    thumb = raw.joints[0, 16] - center
+    model_yaw = float(np.arctan2(thumb[1], thumb[0])) if cli.yaw_source == 'model' else None
+    if model_yaw is not None:
+        print(f'Starting from the model thumb azimuth {np.rad2deg(model_yaw):.0f} deg', flush=True)
 
+    def motions(method, proposed):
+        if method == 'model':
+            yield 'model trajectory', follow_model(source, hands, proposed, table_z)
+        else:
+            for stand_off in (.065, .095):
+                yield f'stand-off {stand_off:.3f} m', approach(source, hands, proposed, table_z, stand_off, center)
+
+    def attempt(method, proposed, yaw):
+        for label, motion in motions(method, proposed):
+            right = decode_hand(motion, hands, 'right')
+            left = decode_hand(motion, hands, 'left')
+            metrics, _ = measure(right, left, hands['right'], field, identity, thresholds, table_z)
+            angles = opposed_contact_angles(right.vertices[-cli.contact_frames:], hands['right'], field, center,
+                                            thresholds['contact_distance_m'])
+            intrusion = outer_wall_intrusion(right.vertices, field, center)
+            offset_m, rotation_deg = palm_deviation(model_palm, palm_frame(right.joints[-1]))
+            metrics.update(thumb_opposition_deg=angles, outer_wall_intrusion_m=intrusion,
+                           palm_offset_from_model_m=offset_m.tolist(), palm_rotation_from_model_deg=rotation_deg,
+                           start_yaw_deg=float(np.rad2deg(yaw)), yaw_source=cli.yaw_source, approach_method=method)
+            print(f'{label}: contacts {metrics["right_contact_counts"]}, '
+                  f'minimum thumb opposition {min(angles):.1f} deg, '
+                  f'max penetration {metrics["right_max_penetration_m"] * 1000:.2f} mm, '
+                  f'outer wall intrusion {intrusion * 1000:.2f} mm, '
+                  f'palm vs model {np.linalg.norm(offset_m) * 1000:.0f} mm / {rotation_deg:.0f} deg', flush=True)
+            if not metrics['passed'] or min(angles) < MIN_OPPOSITION_DEG or intrusion > thresholds['max_penetration_m']:
+                continue
+            bps = encode_object_bps(mesh.vertices, load_object_basis(basis_path))
+            save_npz(cli.output, motion=motion[None], text=[text], seeds=[seeds[cli.index]],
+                     input_mirrored=False, basis_path=str(basis_path), object_bps=bps[None],
+                     mesh_path=str(cli.mesh.resolve()), source_archive=str(cli.candidates.resolve()),
+                     source_index=cli.index, trajectory_method=METHODS[method],
+                     metrics_json=json.dumps(metrics))
+            print(f'Saved verified cup grasp ({METHODS[method]}) to {cli.output}')
+            return True
+        return False
+
+    # Fitting is the expensive part, so fitted endpoints are kept for the synthesized fallback.
+    fitted = []
+    first = 'model' if cli.approach == 'model' else 'synth'
     for offset in range(cli.starts):
-        yaw = offset * (np.pi * (3 - np.sqrt(5)))
+        yaw = start_yaw(offset, model_yaw)
         height = center[2] - mesh.extents[2] * (.15 if offset % 4 < 2 else .22)
         pose = raw_pca * (.75, .55, .9)[offset % 3]
         prior = hands['right'].fk(raw.wrist, raw.rotation, (pose @ hands['right'].components)[None],
@@ -309,29 +393,13 @@ def fit_grasp(cli):
         goal = solver.fit(prior, pose, targets, cli.steps)
         print(f'Fit {offset + 1}/{cli.starts}', flush=True)
         for proposed in contact_variants(goal, hands['right'], field, center, thresholds['contact_distance_m']):
-            for stand_off in (.065, .095):
-                motion = approach(source, hands, proposed, table_z, stand_off, center)
-                right = decode_hand(motion, hands, 'right')
-                left = decode_hand(motion, hands, 'left')
-                metrics, _ = measure(right, left, hands['right'], field, identity, thresholds, table_z)
-                angles = opposed_contact_angles(right.vertices[-cli.contact_frames:], hands['right'], field, center,
-                                                thresholds['contact_distance_m'])
-                intrusion = outer_wall_intrusion(right.vertices, field, center)
-                metrics['thumb_opposition_deg'] = angles
-                metrics['outer_wall_intrusion_m'] = intrusion
-                print(f'Stand-off {stand_off:.3f} m, contacts {metrics["right_contact_counts"]}, '
-                      f'minimum thumb opposition {min(angles):.1f} deg, '
-                      f'max penetration {metrics["right_max_penetration_m"] * 1000:.2f} mm, '
-                      f'outer wall intrusion {intrusion * 1000:.2f} mm', flush=True)
-                if not metrics['passed'] or min(angles) < MIN_OPPOSITION_DEG or intrusion > thresholds['max_penetration_m']:
-                    continue
-                bps = encode_object_bps(mesh.vertices, load_object_basis(basis_path))
-                save_npz(cli.output, motion=motion[None], text=[text], seeds=[seeds[cli.index]],
-                         input_mirrored=False, basis_path=str(basis_path), object_bps=bps[None],
-                         mesh_path=str(cli.mesh.resolve()), source_archive=str(cli.candidates.resolve()),
-                         source_index=cli.index, trajectory_method='Geometry-fitted cup approach',
-                         metrics_json=json.dumps(metrics))
-                print(f'Saved verified cup grasp to {cli.output}')
+            if attempt(first, proposed, yaw):
+                return
+            fitted.append((proposed, yaw))
+    if first == 'model':
+        print('No moved FlowHOI trajectory passed; trying synthesized approaches', flush=True)
+        for proposed, yaw in fitted:
+            if attempt('synth', proposed, yaw):
                 return
     raise ValueError('No fitted cup approach met the contact, clearance, and penetration criteria')
 
@@ -349,6 +417,11 @@ def main():
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--starts', type=int, default=12)
     parser.add_argument('--steps', type=int, default=160)
+    parser.add_argument('--yaw-source', choices=('model', 'legacy'), default='model',
+                        help="model: start fitting at the generated grasp's thumb azimuth. legacy: golden-angle spread")
+    parser.add_argument('--approach', choices=('model', 'synth'), default='model',
+                        help='model: keep the generated trajectory, moved to end at the fitted grasp, and fall back '
+                             'to synthesized approaches. synth: synthesized approaches only, as before')
     cli = parser.parse_args()
     cli.contact_frames = 3
     cli.min_contact_fingers = 2

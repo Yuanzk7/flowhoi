@@ -11,10 +11,12 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from sample.rh56f1_retarget import preshape_joints
 from sample.validate_rh56f1 import LIFT_HEIGHT, load_retarget
 from sample.validate_xarm7_rh56f1 import (
-    ARM_NAMES, ArmTrial, PlanningFailure, add_arm_model_arguments, arm_urdf_path, build_scene,
-    hand_mount_in_flange, load_grasp, plan,
+    ARM_NAMES, ArmTrial, PlanningFailure, add_arm_model_arguments, add_flowhoi_motion_arguments, arm_urdf_path,
+    about_object_axis, build_scene, flange_position, flowhoi_approach, flowhoi_preshape, hand_mount_in_flange,
+    load_grasp, plan, plan_over_symmetry, preshape_states,
 )
 
 
@@ -79,8 +81,14 @@ def inspect_hand(grasp, retarget, raw_limits):
     lower, upper = lower.astype(int), upper.astype(int)
     phases = {}
     violations = []
-    for phase, field in (('open', 'q_open_rad'), ('fitted_grasp', 'q_hand_rad'), ('close_command', 'q_close_command_rad')):
-        radians = finite_array(grasp[field], (6,), field)
+    commands = [(phase, grasp[field], field) for phase, field in
+                (('open', 'q_open_rad'), ('fitted_grasp', 'q_hand_rad'), ('close_command', 'q_close_command_rad'))]
+    if 'preshape' in grasp:
+        # The widest FlowHOI preshape the hand is commanded to during the approach.
+        widest = preshape_joints(grasp['q_open_rad'], float(np.max(grasp['preshape'])))
+        commands.insert(0, ('preshape_widest', widest, 'preshape'))
+    for phase, value, field in commands:
+        radians = finite_array(value, (6,), field)
         if np.any(radians < -1e-8) or np.any(radians > retarget.UPPER + 1e-8):
             raise ValueError(f'{field} is outside the RH56F1 kinematic model bounds')
         raw = retarget.joints_to_raw(radians)
@@ -148,14 +156,25 @@ def inspect_arm(cli, grasp, source, config):
             trial.data.qpos[q_cup:q_cup + 3] = object_pose[:3, 3] + fraction * LIFT_HEIGHT * up
             trial.data.qpos[q_cup + 3:q_cup + 7] = cup_quat
 
-        def clearance(phase, path, samples, *, table_only=False):
-            apply_state = {'close': during_close, 'lift': during_lift}.get(phase)
+        def clearance(phase, path, samples, state=None, *, table_only=False):
+            apply_state = {'close': during_close, 'lift': during_lift}.get(phase, state)
             return trial.clearance(path, phase in ('transit', 'approach'), samples,
                                    pairs=trial.table_pairs if table_only else None, apply_state=apply_state,
                                    cutoff=max(.10, margin * 1.05))
 
+        preshape = flowhoi_preshape(grasp) if cli.preshape == 'flowhoi' else None
+
+        def attempt(yaw):
+            turned = object_pose @ about_object_axis(yaw)
+            goal = turned @ object_flange @ source_mount @ np.linalg.inv(config['T_flange_hand'])
+            approach_dir = flowhoi_approach(grasp, turned) if cli.approach == 'flowhoi' else None
+            return plan(trial, goal, start, margin=margin, up=up, check_path=clearance,
+                        approach_dir=approach_dir, preshape=preshape)
+
         try:
-            paths, targets, _ = plan(trial, target, start, margin=margin, up=up, check_path=clearance)
+            paths, targets, _, choice = plan_over_symmetry(attempt, cli.object_symmetry)
+            result.update(T_base_flange_grasp=targets[1].tolist(),
+                          T_base_tcp_grasp=(targets[1] @ config['T_flange_tcp']).tolist())
         except PlanningFailure as error:
             result.update(grasp_ik_found=error.grasp_ik_found, reason=str(error),
                           best_sampled_clearance_by_phase={
@@ -170,8 +189,11 @@ def inspect_arm(cli, grasp, source, config):
         def stationary(u):
             return np.broadcast_to(grasp_angles, (*np.shape(u), grasp_angles.size))
 
-        phases = (('transit', transit, 97), ('approach', approach, 65), ('close', stationary, 33), ('lift', lift, 65))
-        result.update(status='passed', grasp_ik_found=True, joint_names=ARM_NAMES,
+        used = preshape if choice['hand_mode'] == 'flowhoi' else None
+        states = preshape_states(trial, used, np.linalg.norm(targets[0][:3, 3] - flange_position(trial, start)))
+        phases = (('transit', transit, 97, states[0]), ('approach', approach, 65, states[1]),
+                  ('close', stationary, 33, None), ('lift', lift, 65, None))
+        result.update(status='passed', grasp_ik_found=True, joint_names=ARM_NAMES, **choice,
                       waypoints_rad=dict(start=start.tolist(), pregrasp=approach(0.).tolist(),
                                          grasp=grasp_angles.tolist(), lift=lift(1.).tolist()),
                       flange_targets={key: pose.tolist() for key, pose in zip(('pregrasp', 'grasp', 'lift'), targets)},
@@ -179,9 +201,10 @@ def inspect_arm(cli, grasp, source, config):
                                    T_flange_tcp=config['T_flange_tcp'].tolist()),
                       clearances={
                           phase: dict(samples=count,
-                                      robot=describe_clearance(clearance(phase, path, count), margin),
-                                      table=describe_clearance(clearance(phase, path, count, table_only=True), margin))
-                          for phase, path, count in phases
+                                      robot=describe_clearance(clearance(phase, path, count, state), margin),
+                                      table=describe_clearance(clearance(phase, path, count, state, table_only=True),
+                                                               margin))
+                          for phase, path, count, state in phases
                       })
     return result
 
@@ -226,6 +249,7 @@ def main():
     parser.add_argument('--frame', type=int, default=49)
     parser.add_argument('--retarget-module', type=Path, help='Override the bundled RH56F1 retarget module')
     add_arm_model_arguments(parser)
+    add_flowhoi_motion_arguments(parser)
     cli = parser.parse_args()
     if cli.output.suffix != '.json':
         parser.error('--output must end in .json')
